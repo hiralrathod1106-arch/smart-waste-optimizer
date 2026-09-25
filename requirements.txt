@@ -4,3 +4,8 @@ folium
 streamlit-folium
 scikit-learn
 ortools
+fastapi
+uvicorn
+supabase
+python-dotenv
+requests

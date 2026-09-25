@@ -5,6 +5,7 @@ import folium
 from streamlit_folium import st_folium
 from sklearn.linear_model import LinearRegression
 import math
+import requests
 
 from ortools.constraint_solver import pywrapcp
 from ortools.constraint_solver import routing_enums_pb2
@@ -19,6 +20,13 @@ st.set_page_config(
     page_icon="🗑️",
     layout="wide"
 )
+
+
+# ==================================================
+# FASTAPI SETTINGS
+# ==================================================
+
+API_URL = "http://127.0.0.1:8001"
 
 
 # ==================================================
@@ -92,54 +100,170 @@ hr {
 
 
 # ==================================================
-# LOAD DATA
+# DEPOT
 # ==================================================
 
-data = pd.read_csv("bins.csv")
-history = pd.read_csv("fill_history.csv")
-
-history["date"] = pd.to_datetime(history["date"])
+DEPOT_LAT = 19.0760
+DEPOT_LON = 72.8777
 
 
 # ==================================================
-# COLLECTION STATUS
+# FASTAPI HELPER FUNCTIONS
 # ==================================================
 
-STATUS_FILE = "collection_status.csv"
+def get_api_data(endpoint):
+    """
+    Get data from the FastAPI backend.
+    Returns None if the backend is unavailable.
+    """
 
-if os.path.exists(STATUS_FILE):
-    status_data = pd.read_csv(STATUS_FILE)
+    try:
+        response = requests.get(
+            f"{API_URL}{endpoint}",
+            timeout=5
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except requests.exceptions.RequestException:
+        return None
+
+
+def mark_collected_api(bin_id):
+    """
+    Mark a bin as collected through FastAPI.
+    """
+
+    try:
+        response = requests.put(
+            f"{API_URL}/bins/{bin_id}/collect",
+            timeout=5
+        )
+
+        response.raise_for_status()
+
+        return response.json()
+
+    except requests.exceptions.RequestException:
+        return None
+
+
+# ==================================================
+# LOAD LOCAL DATA
+# ==================================================
+
+try:
+
+    local_data = pd.read_csv("bins.csv")
+
+except Exception:
+
+    local_data = pd.DataFrame()
+
+
+try:
+
+    local_history = pd.read_csv("fill_history.csv")
+
+    local_history["date"] = pd.to_datetime(
+        local_history["date"]
+    )
+
+except Exception:
+
+    local_history = pd.DataFrame()
+
+
+# ==================================================
+# LOAD DATA FROM FASTAPI
+# ==================================================
+
+dashboard_response = get_api_data("/dashboard")
+
+history_api_available = False
+
+
+if dashboard_response and "bins" in dashboard_response:
+
+    data = pd.DataFrame(
+        dashboard_response["bins"]
+    )
+
+    backend_connected = True
+
 else:
-    status_data = pd.DataFrame(
-        columns=["bin_id", "status"]
-    )
 
-if "bin_id" not in status_data.columns:
-    status_data = pd.DataFrame(
-        columns=["bin_id", "status"]
-    )
+    data = local_data.copy()
 
-status_map = dict(
-    zip(
-        status_data["bin_id"],
-        status_data["status"]
-    )
-)
+    backend_connected = False
 
-data["status"] = (
-    data["bin_id"]
-    .map(status_map)
-    .fillna("Pending")
-)
 
-status_data = data[
-    ["bin_id", "status"]
-].copy()
+# ==================================================
+# LOAD FILL HISTORY
+# ==================================================
 
-status_data.to_csv(
-    STATUS_FILE,
-    index=False
-)
+if backend_connected:
+
+    all_history = []
+
+    if not data.empty and "bin_id" in data.columns:
+
+        for bin_id in data["bin_id"]:
+
+            history_response = get_api_data(
+                f"/fill-history/{bin_id}"
+            )
+
+            if (
+                history_response
+                and "history" in history_response
+            ):
+
+                for item in history_response["history"]:
+
+                    all_history.append(item)
+
+        if all_history:
+
+            history = pd.DataFrame(
+                all_history
+            )
+
+            if "date" in history.columns:
+
+                history["date"] = pd.to_datetime(
+                    history["date"]
+                )
+
+            history_api_available = True
+
+        else:
+
+            history = local_history.copy()
+
+    else:
+
+        history = local_history.copy()
+
+else:
+
+    history = local_history.copy()
+
+
+# ==================================================
+# ENSURE REQUIRED COLUMNS
+# ==================================================
+
+if "status" not in data.columns:
+
+    data["status"] = "Pending"
+
+
+if "fill_level" not in data.columns:
+
+    data["fill_level"] = 0
 
 
 # ==================================================
@@ -158,7 +282,8 @@ high = len(
 )
 
 normal = len(
-    data[data["fill_level"] < 70
+    data[
+        data["fill_level"] < 70
     ]
 )
 
@@ -170,7 +295,9 @@ collection_required = len(
 )
 
 collected = len(
-    data[data["status"] == "Collected"]
+    data[
+        data["status"] == "Collected"
+    ]
 )
 
 
@@ -190,6 +317,18 @@ st.sidebar.write(
 )
 
 st.sidebar.divider()
+
+if backend_connected:
+
+    st.sidebar.success(
+        "🟢 FastAPI Connected"
+    )
+
+else:
+
+    st.sidebar.warning(
+        "🟠 FastAPI Offline"
+    )
 
 page = st.sidebar.radio(
     "Navigation",
@@ -238,24 +377,28 @@ if page == "🏠 Dashboard":
     col1, col2, col3, col4 = st.columns(4)
 
     with col1:
+
         st.metric(
             "🗑️ Total Bins",
             len(data)
         )
 
     with col2:
+
         st.metric(
             "🔴 Critical",
             critical
         )
 
     with col3:
+
         st.metric(
             "🟠 High Fill",
             high
         )
 
     with col4:
+
         st.metric(
             "🟢 Normal",
             normal
@@ -272,19 +415,23 @@ if page == "🏠 Dashboard":
     col1, col2, col3 = st.columns(3)
 
     with col1:
+
         st.metric(
             "Bins Requiring Collection",
             collection_required
         )
 
     with col2:
+
         st.metric(
             "Collected Bins",
             collected
         )
 
     with col3:
+
         pending = len(data) - collected
+
         st.metric(
             "Pending Bins",
             pending
@@ -386,22 +533,24 @@ if page == "🏠 Dashboard":
                     key=f"dashboard_collect_{row['bin_id']}"
                 ):
 
-                    status_data.loc[
-                        status_data["bin_id"]
-                        == row["bin_id"],
-                        "status"
-                    ] = "Collected"
-
-                    status_data.to_csv(
-                        STATUS_FILE,
-                        index=False
+                    result = mark_collected_api(
+                        row["bin_id"]
                     )
 
-                    st.success(
-                        f"{row['bin_id']} marked as collected."
-                    )
+                    if result:
 
-                    st.rerun()
+                        st.success(
+                            f"{row['bin_id']} marked as collected."
+                        )
+
+                        st.rerun()
+
+                    else:
+
+                        st.error(
+                            "Could not update the bin "
+                            "through FastAPI."
+                        )
 
     else:
 
@@ -463,8 +612,8 @@ elif page == "🗑️ Bin Information":
 
     waste_map = folium.Map(
         location=[
-            19.0760,
-            72.8777
+            DEPOT_LAT,
+            DEPOT_LON
         ],
         zoom_start=11
     )
@@ -472,15 +621,19 @@ elif page == "🗑️ Bin Information":
     for _, row in data.iterrows():
 
         if row["fill_level"] >= 90:
+
             icon_color = "red"
 
         elif row["fill_level"] >= 70:
+
             icon_color = "orange"
 
         else:
+
             icon_color = "green"
 
         folium.Marker(
+
             location=[
                 row["latitude"],
                 row["longitude"]
@@ -528,133 +681,277 @@ elif page == "🤖 Fill Forecasting":
 
     st.divider()
 
-    selected_bin = st.selectbox(
-        "Select Waste Bin",
-        data["bin_id"].tolist()
-    )
+    if data.empty:
 
-    bin_history = history[
-        history["bin_id"] == selected_bin
-    ].copy()
-
-    if len(bin_history) >= 2:
-
-        bin_history["day"] = range(
-            len(bin_history)
+        st.warning(
+            "No bin data available."
         )
 
-        X = bin_history[["day"]]
-        y = bin_history["fill_level"]
+    else:
 
-        model = LinearRegression()
-
-        model.fit(X, y)
-
-        current_day = (
-            len(bin_history) - 1
+        selected_bin = st.selectbox(
+            "Select Waste Bin",
+            data["bin_id"].tolist()
         )
 
-        future_days = pd.DataFrame(
-            {
-                "day": [
-                    current_day + 1,
-                    current_day + 2,
-                    current_day + 3
-                ]
-            }
+        # ------------------------------------------
+        # USE FASTAPI FORECAST
+        # ------------------------------------------
+
+        forecast_response = get_api_data(
+            f"/forecast/{selected_bin}"
         )
 
-        predictions = model.predict(
-            future_days
-        )
+        if (
+            forecast_response
+            and "forecast" in forecast_response
+        ):
 
-        predictions = [
-            max(
-                0,
-                min(
-                    100,
-                    value
-                )
-            )
-            for value in predictions
-        ]
-
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-
-            st.metric(
-                "Tomorrow",
-                f"{predictions[0]:.1f}%"
-            )
-
-        with col2:
-
-            st.metric(
-                "After 2 Days",
-                f"{predictions[1]:.1f}%"
-            )
-
-        with col3:
-
-            st.metric(
-                "After 3 Days",
-                f"{predictions[2]:.1f}%"
-            )
-
-        st.divider()
-
-        st.write(
-            "### 📈 Predicted Fill-Level"
-        )
-
-        chart_data = pd.DataFrame(
-            {
-                "Historical Fill Level":
-                    bin_history["fill_level"].tolist()
-                    + [None, None, None],
-
-                "Predicted Fill Level":
-                    [None] * len(bin_history)
-                    + predictions
-            }
-        )
-
-        st.line_chart(
-            chart_data,
-            y=[
-                "Historical Fill Level",
-                "Predicted Fill Level"
+            forecast_data = forecast_response[
+                "forecast"
             ]
-        )
 
-        if predictions[0] >= 90:
+            predictions = [
+                item["predicted_fill"]
+                for item in forecast_data
+            ]
 
-            st.error(
-                "🚨 This bin is predicted to "
-                "reach critical level soon!"
+            historical_data = forecast_response.get(
+                "historical_data",
+                []
             )
 
-        elif predictions[0] >= 80:
+            bin_history = pd.DataFrame(
+                historical_data
+            )
 
-            st.warning(
-                "⚠️ This bin is approaching "
-                "the collection threshold."
+            if not bin_history.empty:
+
+                if "date" in bin_history.columns:
+
+                    bin_history["date"] = pd.to_datetime(
+                        bin_history["date"]
+                    )
+
+            # --------------------------------------
+            # FORECAST METRICS
+            # --------------------------------------
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+
+                st.metric(
+                    "Tomorrow",
+                    f"{predictions[0]:.1f}%"
+                )
+
+            with col2:
+
+                st.metric(
+                    "After 2 Days",
+                    f"{predictions[1]:.1f}%"
+                )
+
+            with col3:
+
+                st.metric(
+                    "After 3 Days",
+                    f"{predictions[2]:.1f}%"
+                )
+
+            st.divider()
+
+            st.write(
+                "### 📈 Predicted Fill-Level"
+            )
+
+            # Historical + predicted chart
+
+            if (
+                not bin_history.empty
+                and "fill_level" in bin_history.columns
+            ):
+
+                chart_data = pd.DataFrame(
+                    {
+                        "Historical Fill Level":
+                            bin_history["fill_level"].tolist()
+                            + [None, None, None],
+
+                        "Predicted Fill Level":
+                            [None] * len(bin_history)
+                            + predictions
+                    }
+                )
+
+                st.line_chart(
+                    chart_data,
+                    y=[
+                        "Historical Fill Level",
+                        "Predicted Fill Level"
+                    ]
+                )
+
+            # --------------------------------------
+            # FORECAST WARNING
+            # --------------------------------------
+
+            if predictions[0] >= 90:
+
+                st.error(
+                    "🚨 This bin is predicted to "
+                    "reach critical level soon!"
+                )
+
+            elif predictions[0] >= 80:
+
+                st.warning(
+                    "⚠️ This bin is approaching "
+                    "the collection threshold."
+                )
+
+            else:
+
+                st.success(
+                    "✅ This bin does not require "
+                    "immediate collection."
+                )
+
+            st.caption(
+                "Forecast generated by the FastAPI "
+                "backend using Linear Regression."
             )
 
         else:
 
-            st.success(
-                "✅ This bin does not require "
-                "immediate collection."
+            # --------------------------------------
+            # FALLBACK TO LOCAL FORECAST
+            # --------------------------------------
+
+            st.warning(
+                "FastAPI forecast unavailable. "
+                "Using local historical data."
             )
 
-    else:
+            bin_history = history[
+                history["bin_id"] == selected_bin
+            ].copy()
 
-        st.warning(
-            "Not enough historical data "
-            "for forecasting."
-        )
+            if len(bin_history) >= 2:
+
+                bin_history["day"] = range(
+                    len(bin_history)
+                )
+
+                X = bin_history[["day"]]
+                y = bin_history["fill_level"]
+
+                model = LinearRegression()
+
+                model.fit(X, y)
+
+                current_day = (
+                    len(bin_history) - 1
+                )
+
+                future_days = pd.DataFrame(
+                    {
+                        "day": [
+                            current_day + 1,
+                            current_day + 2,
+                            current_day + 3
+                        ]
+                    }
+                )
+
+                predictions = model.predict(
+                    future_days
+                )
+
+                predictions = [
+                    max(
+                        0,
+                        min(
+                            100,
+                            value
+                        )
+                    )
+                    for value in predictions
+                ]
+
+                col1, col2, col3 = st.columns(3)
+
+                with col1:
+
+                    st.metric(
+                        "Tomorrow",
+                        f"{predictions[0]:.1f}%"
+                    )
+
+                with col2:
+
+                    st.metric(
+                        "After 2 Days",
+                        f"{predictions[1]:.1f}%"
+                    )
+
+                with col3:
+
+                    st.metric(
+                        "After 3 Days",
+                        f"{predictions[2]:.1f}%"
+                    )
+
+                st.divider()
+
+                chart_data = pd.DataFrame(
+                    {
+                        "Historical Fill Level":
+                            bin_history["fill_level"].tolist()
+                            + [None, None, None],
+
+                        "Predicted Fill Level":
+                            [None] * len(bin_history)
+                            + predictions
+                    }
+                )
+
+                st.line_chart(
+                    chart_data,
+                    y=[
+                        "Historical Fill Level",
+                        "Predicted Fill Level"
+                    ]
+                )
+
+                if predictions[0] >= 90:
+
+                    st.error(
+                        "🚨 This bin is predicted to "
+                        "reach critical level soon!"
+                    )
+
+                elif predictions[0] >= 80:
+
+                    st.warning(
+                        "⚠️ This bin is approaching "
+                        "the collection threshold."
+                    )
+
+                else:
+
+                    st.success(
+                        "✅ This bin does not require "
+                        "immediate collection."
+                    )
+
+            else:
+
+                st.warning(
+                    "Not enough historical data "
+                    "for forecasting."
+                )
 
 
 # ==================================================
@@ -673,9 +970,6 @@ elif page == "🚛 Route Optimization":
     )
 
     st.divider()
-
-    DEPOT_LAT = 19.0760
-    DEPOT_LON = 72.8777
 
     route_bins = data[
         (data["fill_level"] >= 80) &
@@ -706,7 +1000,9 @@ elif page == "🚛 Route Optimization":
                 )
             )
 
+        # ------------------------------------------
         # Distance function
+        # ------------------------------------------
 
         def calculate_distance(
             lat1,
@@ -728,7 +1024,9 @@ elif page == "🚛 Route Optimization":
                 lon_distance ** 2
             )
 
+        # ------------------------------------------
         # Baseline route
+        # ------------------------------------------
 
         baseline_distance = 0
 
@@ -759,7 +1057,9 @@ elif page == "🚛 Route Optimization":
             DEPOT_LON
         )
 
+        # ------------------------------------------
         # Distance matrix
+        # ------------------------------------------
 
         distance_matrix = []
 
@@ -790,7 +1090,9 @@ elif page == "🚛 Route Optimization":
                 row_distances
             )
 
+        # ------------------------------------------
         # OR-Tools
+        # ------------------------------------------
 
         manager = pywrapcp.RoutingIndexManager(
             len(distance_matrix),
@@ -906,7 +1208,9 @@ elif page == "🚛 Route Optimization":
 
                 improvement = 0
 
-            # Performance
+            # --------------------------------------
+            # PERFORMANCE
+            # --------------------------------------
 
             st.subheader(
                 "📊 Route Performance"
@@ -958,7 +1262,9 @@ elif page == "🚛 Route Optimization":
                     "current bin locations."
                 )
 
-            # Comparison chart
+            # --------------------------------------
+            # COMPARISON CHART
+            # --------------------------------------
 
             comparison_data = pd.DataFrame(
                 {
@@ -984,7 +1290,9 @@ elif page == "🚛 Route Optimization":
 
             st.divider()
 
-            # Route map
+            # --------------------------------------
+            # ROUTE MAP
+            # --------------------------------------
 
             st.write(
                 "### 🗺️ Optimized Route Map"
@@ -1072,7 +1380,9 @@ elif page == "🚛 Route Optimization":
 
             st.divider()
 
-            # Route information
+            # --------------------------------------
+            # ROUTE INFORMATION
+            # --------------------------------------
 
             col1, col2 = st.columns(2)
 
@@ -1095,7 +1405,9 @@ elif page == "🚛 Route Optimization":
                 "generated using OR-Tools."
             )
 
-            # Collection order
+            # --------------------------------------
+            # COLLECTION ORDER
+            # --------------------------------------
 
             st.write(
                 "### 📋 Collection Order"
@@ -1169,8 +1481,6 @@ elif page == "📊 Results":
 
     st.divider()
 
-    # Overall statistics
-
     st.subheader(
         "📌 Overall System Statistics"
     )
@@ -1207,8 +1517,6 @@ elif page == "📊 Results":
 
     st.divider()
 
-    # Route results
-
     st.subheader(
         "🚛 Route Optimization Results"
     )
@@ -1219,9 +1527,6 @@ elif page == "📊 Results":
     ].copy()
 
     if len(route_bins) > 0:
-
-        DEPOT_LAT = 19.0760
-        DEPOT_LON = 72.8777
 
         locations = [
             (
@@ -1446,7 +1751,7 @@ elif page == "📊 Results":
                 st.success(
                     f"🎯 Route efficiency improved by "
                     f"{improvement:.1f}% compared with "
-                    f"the baseline route."
+                    "the baseline route."
                 )
 
             else:
@@ -1470,8 +1775,6 @@ elif page == "📊 Results":
         )
 
     st.divider()
-
-    # Final project summary
 
     st.subheader(
         "🏆 Project Summary"
@@ -1546,6 +1849,8 @@ elif page == "ℹ️ About Project":
         """
         - Python
         - Streamlit
+        - FastAPI
+        - Supabase
         - Pandas
         - Scikit-learn
         - Folium
@@ -1568,6 +1873,8 @@ elif page == "ℹ️ About Project":
         - OR-Tools route optimization
         - Route distance comparison
         - Performance evaluation
+        - FastAPI backend integration
+        - Supabase database integration
         - Professional dashboard interface
         """
     )
