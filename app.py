@@ -25,8 +25,7 @@ st.set_page_config(
 # ==================================================
 # FASTAPI SETTINGS
 # ==================================================
-
-API_URL = "http://127.0.0.1:8001"
+API_URL = st.secrets.get("API_URL", os.getenv("API_URL", "http://127.0.0.1:8001")).rstrip("/")
 
 
 # ==================================================
@@ -120,7 +119,7 @@ def get_api_data(endpoint):
     try:
         response = requests.get(
             f"{API_URL}{endpoint}",
-            timeout=5
+            timeout=60
         )
 
         response.raise_for_status()
