@@ -118,15 +118,14 @@ def get_statuses(db=Depends(get_db)):
     return {"statuses": db.table("collection_status").select("*").execute().data}
 
 
-@app.get("/alerts")
-def get_alerts(threshold: int = CRITICAL_THRESHOLD, db=Depends(get_db)):
-    """Overflow alerts: bins at/above the threshold that are not yet collected."""
+@app.get("/smart-alerts")
+def smart_alerts(db=Depends(get_db)):
+    """Current + predicted overflow alerts with area names, most urgent first (used by the dashboard)."""
     bins = get_dashboard(db)["bins"]
-    alerts = [
-        {**b, "level": "CRITICAL" if b["fill_level"] >= CRITICAL_THRESHOLD else "HIGH"}
-        for b in bins if b["fill_level"] >= threshold and b["status"] != "Collected"
-    ]
-    return {"threshold": threshold, "count": len(alerts), "alerts": alerts}
+    history = db.table("fill_history").select("*").order("date").execute().data
+    alerts = classify_alerts(bins, history)
+    return {"count": len(alerts), "alerts": alerts}
+
 
 
 # ---------------------------------------------------------------- history & sensor intake
