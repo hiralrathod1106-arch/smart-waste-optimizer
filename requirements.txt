@@ -1,5 +1,5 @@
 # Streamlit frontend (Streamlit Community Cloud installs this file)
-streamlit>=1.40
+streamlit>=1.49
 pandas>=2.2
 folium>=0.17
 streamlit-folium>=0.22
