@@ -71,6 +71,17 @@ def load_bins():
 
 
 data, mode = load_bins()
+
+
+def load_alerts():
+    """Collector alerts from the backend (empty list when offline)."""
+    try:
+        return api_get("/smart-alerts")["alerts"]
+    except Exception:
+        return []
+
+
+ICON = {"CRITICAL": "🔴", "FULL": "🟠", "UPCOMING": "🟡"}
 data["fill_level"] = pd.to_numeric(data["fill_level"])
 to_collect = data[(data["fill_level"] >= COLLECT_AT) & (data["status"] != "Collected")]
 
@@ -85,8 +96,25 @@ else:
     if st.sidebar.button("Retry connection"):
         api_get.clear()
         st.rerun()
-page = st.sidebar.radio("Navigation", ["🏠 Dashboard", "🗺️ Bin Map", "🤖 Fill Forecasting",
+alerts = load_alerts() if mode == "api" else []
+urgent = [a for a in alerts if a["severity"] != "UPCOMING"]
+st.sidebar.metric("🔔 Active alerts", len(alerts), f"{len(urgent)} need collection now" if urgent else None,
+                  delta_color="inverse")
+page = st.sidebar.radio("Navigation", ["🔔 Alerts", "🏠 Dashboard", "🗺️ Bin Map", "🤖 Fill Forecasting",
                                        "🚛 Route Optimization", "📊 Results", "🧾 Service History", "ℹ️ About"])
+
+
+# ------------------------------------------------------------ alert banner (every page) + pop-up for new alerts
+if alerts and page != "🔔 Alerts":
+    lines = [f"{ICON[a['severity']]} **{a['bin_id']}** - {a['location']}: {a['message']}" for a in alerts[:5]]
+    (st.error if urgent else st.warning)("**Collection alerts**  \n" + "  \n".join(lines) +
+                                        ("  \n...see the 🔔 Alerts page for all" if len(alerts) > 5 else ""))
+seen = st.session_state.setdefault("seen_alerts", set())
+for a in alerts:
+    key = (a["bin_id"], a["severity"])
+    if key not in seen:
+        seen.add(key)
+        st.toast(f"{a['bin_id']} ({a['location']}): {a['message']}", icon=ICON[a["severity"]])
 
 
 # ------------------------------------------------------------ pages
@@ -105,7 +133,36 @@ def bin_map(df, route=None):
     st_folium(m, width=1200, height=520, returned_objects=[])
 
 
-if page == "🏠 Dashboard":
+if page == "🔔 Alerts":
+    st.title("🔔 Collection Alerts")
+    st.caption("Bins that are full now or forecast to fill soon, grouped by area. Refreshes every 30 seconds.")
+
+    @st.fragment(run_every=30)
+    def alerts_panel():
+        try:
+            live = api_get("/smart-alerts")["alerts"]
+        except Exception:
+            st.warning("Alerts need the backend connection.")
+            return
+        if not live:
+            st.success("✅ No bins are full or about to fill. Nothing to collect.")
+            return
+        c = st.columns(3)
+        c[0].metric("🔴 Critical (≥90%)", sum(a["severity"] == "CRITICAL" for a in live))
+        c[1].metric("🟠 Full (≥80%)", sum(a["severity"] == "FULL" for a in live))
+        c[2].metric("🟡 Filling soon", sum(a["severity"] == "UPCOMING" for a in live))
+        st.subheader("Where to go (by area)")
+        for a in live:
+            x, y, z = st.columns([3, 4, 1])
+            x.write(f"{ICON[a['severity']]} **{a['location']}** - {a['bin_id']}")
+            y.write(a["message"])
+            maps = f"https://www.google.com/maps?q={a['latitude']},{a['longitude']}"
+            z.link_button("Map", maps)
+        st.caption("Click 'Map' to open the bin's location in Google Maps. Use Route Optimization for the best order.")
+
+    alerts_panel()
+
+elif page == "🏠 Dashboard":
     st.title("🗑️ Smart Waste Collection Optimizer")
     c = st.columns(4)
     c[0].metric("Total bins", len(data))

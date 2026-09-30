@@ -30,3 +30,37 @@ def forecast_from_history(history, horizon=3):
     if slope > 0 and y[-1] < 100:
         days_to_full = round((100 - y[-1]) / slope, 1)
     return preds, mae, days_to_full
+
+
+COLLECT_AT = 80
+CRITICAL_AT = 90
+_SEV_ORDER = {"CRITICAL": 0, "FULL": 1, "UPCOMING": 2}
+
+
+def classify_alerts(bins, history):
+    """Collector alerts for every uncollected bin.
+    CRITICAL >= 90% now | FULL >= 80% now | UPCOMING = forecast reaches 80% within 3 readings/days."""
+    by_bin = {}
+    for h in history:
+        by_bin.setdefault(h["bin_id"], []).append(h)
+    alerts = []
+    for b in bins:
+        if b.get("status") == "Collected":
+            continue
+        level = float(b["fill_level"])
+        rows = by_bin.get(b["bin_id"], [])
+        preds = forecast_from_history(rows)[0] if len(rows) >= 2 else []
+        eta = next((i + 1 for i, p in enumerate(preds) if p >= COLLECT_AT), None)
+        if level >= CRITICAL_AT:
+            sev, msg = "CRITICAL", f"{level:.0f}% full - collect immediately"
+        elif level >= COLLECT_AT:
+            sev, msg = "FULL", f"{level:.0f}% full - needs collection"
+        elif eta:
+            sev, msg = "UPCOMING", f"{level:.0f}% now, forecast to pass {COLLECT_AT}% in {eta} day(s)"
+        else:
+            continue
+        alerts.append({"bin_id": b["bin_id"], "location": b["location"], "latitude": b["latitude"],
+                       "longitude": b["longitude"], "fill_level": level, "severity": sev,
+                       "eta_days": eta, "message": msg})
+    alerts.sort(key=lambda a: (_SEV_ORDER[a["severity"]], -a["fill_level"]))
+    return alerts
