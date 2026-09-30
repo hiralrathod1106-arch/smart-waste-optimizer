@@ -16,7 +16,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
-from forecasting import forecast_from_history
+from forecasting import classify_alerts, forecast_from_history
 
 # config.env is only used locally; on Render the values come from Environment variables.
 load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.env"))
