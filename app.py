@@ -1,1906 +1,237 @@
-import streamlit as st
+"""Smart Waste Collection Optimizer - Streamlit frontend.
+
+Talks to the FastAPI backend on Render (which stores data in Supabase).
+Set API_URL / API_KEY in .streamlit/secrets.toml (local) or Streamlit Cloud > Secrets.
+"""
 import os
-import pandas as pd
+
 import folium
-from streamlit_folium import st_folium
-from sklearn.linear_model import LinearRegression
-import math
+import pandas as pd
 import requests
+import streamlit as st
+from streamlit_folium import st_folium
 
-from ortools.constraint_solver import pywrapcp
-from ortools.constraint_solver import routing_enums_pb2
+import optimizer as opt
 
-
-# ==================================================
-# PAGE SETTINGS
-# ==================================================
-
-st.set_page_config(
-    page_title="Smart Waste Collection Optimizer",
-    page_icon="🗑️",
-    layout="wide"
-)
+st.set_page_config(page_title="Smart Waste Collection Optimizer", page_icon="🗑️", layout="wide")
 
 
-# ==================================================
-# FASTAPI SETTINGS
-# ==================================================
-try:
-    API_URL = st.secrets["API_URL"]
-except Exception:
-    API_URL = os.getenv("API_URL", "http://127.0.0.1:8001")
-
-API_URL = API_URL.rstrip("/")
-
-
-# ==================================================
-# PROFESSIONAL UI STYLING
-# ==================================================
-
-st.markdown("""
-<style>
-
-.main {
-    padding-top: 1rem;
-}
-
-.block-container {
-    padding-top: 2rem;
-    padding-bottom: 2rem;
-}
-
-/* Main headings */
-h1 {
-    font-weight: 700;
-    letter-spacing: -1px;
-}
-
-h2, h3 {
-    font-weight: 600;
-}
-
-/* Sidebar */
-[data-testid="stSidebar"] {
-    border-right: 1px solid #dddddd;
-}
-
-[data-testid="stSidebar"] h1 {
-    font-size: 24px;
-}
-
-/* Metric cards */
-[data-testid="stMetric"] {
-    border: 1px solid #dddddd;
-    border-radius: 12px;
-    padding: 15px;
-    background-color: #ffffff;
-}
-
-/* Buttons */
-.stButton > button {
-    border-radius: 8px;
-    font-weight: 600;
-    min-height: 40px;
-}
-
-/* Alerts */
-.stAlert {
-    border-radius: 10px;
-}
-
-/* Dataframes */
-[data-testid="stDataFrame"] {
-    border-radius: 10px;
-}
-
-/* Divider */
-hr {
-    margin-top: 1.5rem;
-    margin-bottom: 1.5rem;
-}
-
-</style>
-""", unsafe_allow_html=True)
-
-
-# ==================================================
-# DEPOT
-# ==================================================
-
-DEPOT_LAT = 19.0760
-DEPOT_LON = 72.8777
-
-
-# ==================================================
-# FASTAPI HELPER FUNCTIONS
-# ==================================================
-
-def get_api_data(endpoint):
-    """
-    Get data from the FastAPI backend.
-    Returns None if the backend is unavailable.
-    """
-
+# ------------------------------------------------------------ settings
+def _secret(name, default=""):
     try:
-        response = requests.get(
-            f"{API_URL}{endpoint}",
-            timeout=60
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
-    except requests.exceptions.RequestException:
-        return None
+        return st.secrets[name]
+    except Exception:  # no secrets file
+        return os.getenv(name, default)
 
 
-def mark_collected_api(bin_id):
-    """
-    Mark a bin as collected through FastAPI.
-    """
+API_URL = _secret("API_URL", "http://127.0.0.1:8001").rstrip("/")   # was hard-coded to 127.0.0.1 before
+API_KEY = _secret("API_KEY", "")
+HEADERS = {"X-API-Key": API_KEY} if API_KEY else {}
+DEPOT_LAT, DEPOT_LON = opt.DEPOT
+COLLECT_AT, CRITICAL_AT = 80, 90
 
+
+# ------------------------------------------------------------ API helpers
+@st.cache_data(ttl=20, show_spinner=False)
+def api_get(path):
+    """GET with retries: Render free instances sleep and need ~30-50 s to wake up."""
+    last = None
+    for _ in range(3):
+        try:
+            r = requests.get(f"{API_URL}{path}", headers=HEADERS, timeout=45)
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            last = e
+    raise RuntimeError(str(last))
+
+
+def api_put(path):
+    r = requests.put(f"{API_URL}{path}", headers=HEADERS, timeout=45)
+    r.raise_for_status()
+    api_get.clear()  # refresh cached data
+    return r.json()
+
+
+@st.cache_data(show_spinner=False)
+def load_csv(name):
+    return pd.read_csv(os.path.join("data", name))
+
+
+def load_bins():
+    """Returns (dataframe, mode). Falls back to the CSV demo data if the API is unreachable."""
     try:
-        response = requests.put(
-            f"{API_URL}/bins/{bin_id}/collect",
-            timeout=5
-        )
-
-        response.raise_for_status()
-
-        return response.json()
-
-    except requests.exceptions.RequestException:
-        return None
-
-
-# ==================================================
-# LOAD LOCAL DATA
-# ==================================================
-
-try:
-
-    local_data = pd.read_csv("bins.csv")
-
-except Exception:
-
-    local_data = pd.DataFrame()
-
-
-try:
-
-    local_history = pd.read_csv("fill_history.csv")
-
-    local_history["date"] = pd.to_datetime(
-        local_history["date"]
-    )
-
-except Exception:
-
-    local_history = pd.DataFrame()
-
-
-# ==================================================
-# LOAD DATA FROM FASTAPI
-# ==================================================
-
-dashboard_response = get_api_data("/dashboard")
-
-history_api_available = False
-
-
-if dashboard_response and "bins" in dashboard_response:
-
-    data = pd.DataFrame(
-        dashboard_response["bins"]
-    )
-
-    backend_connected = True
-
-else:
-
-    data = local_data.copy()
-
-    backend_connected = False
-
-
-# ==================================================
-# LOAD FILL HISTORY
-# ==================================================
-
-if backend_connected:
-
-    all_history = []
-
-    if not data.empty and "bin_id" in data.columns:
-
-        for bin_id in data["bin_id"]:
-
-            history_response = get_api_data(
-                f"/fill-history/{bin_id}"
-            )
-
-            if (
-                history_response
-                and "history" in history_response
-            ):
-
-                for item in history_response["history"]:
-
-                    all_history.append(item)
-
-        if all_history:
-
-            history = pd.DataFrame(
-                all_history
-            )
-
-            if "date" in history.columns:
-
-                history["date"] = pd.to_datetime(
-                    history["date"]
-                )
-
-            history_api_available = True
-
-        else:
-
-            history = local_history.copy()
-
-    else:
-
-        history = local_history.copy()
-
-else:
-
-    history = local_history.copy()
-
-
-# ==================================================
-# ENSURE REQUIRED COLUMNS
-# ==================================================
-
-if "status" not in data.columns:
-
-    data["status"] = "Pending"
-
-
-if "fill_level" not in data.columns:
-
-    data["fill_level"] = 0
-
-
-# ==================================================
-# BIN STATUS
-# ==================================================
-
-critical = len(
-    data[data["fill_level"] >= 90]
-)
-
-high = len(
-    data[
-        (data["fill_level"] >= 70) &
-        (data["fill_level"] < 90)
-    ]
-)
-
-normal = len(
-    data[
-        data["fill_level"] < 70
-    ]
-)
-
-collection_required = len(
-    data[
-        (data["fill_level"] >= 80) &
-        (data["status"] != "Collected")
-    ]
-)
-
-collected = len(
-    data[
-        data["status"] == "Collected"
-    ]
-)
-
-
-# ==================================================
-# SIDEBAR
-# ==================================================
-
+        with st.spinner("Contacting backend (Render may take up to a minute to wake up)..."):
+            return pd.DataFrame(api_get("/dashboard")["bins"]), "api"
+    except Exception as e:
+        st.session_state["api_error"] = str(e)
+        df = load_csv("bins.csv").copy()
+        df["status"] = "Pending"
+        return df, "csv"
+
+
+data, mode = load_bins()
+data["fill_level"] = pd.to_numeric(data["fill_level"])
+to_collect = data[(data["fill_level"] >= COLLECT_AT) & (data["status"] != "Collected")]
+
+# ------------------------------------------------------------ sidebar
 st.sidebar.title("🗑️ Smart Waste")
-
-st.sidebar.subheader(
-    "Collection Optimizer"
-)
-
-st.sidebar.write(
-    "Smart waste monitoring, forecasting "
-    "and route planning."
-)
-
-st.sidebar.divider()
-
-if backend_connected:
-
-    st.sidebar.success(
-        "🟢 FastAPI Connected"
-    )
-
+st.sidebar.caption("Fill-level forecasting & route planning")
+if mode == "api":
+    st.sidebar.success("🟢 Backend + Supabase connected")
 else:
-
-    st.sidebar.warning(
-        "🟠 FastAPI Offline"
-    )
-
-page = st.sidebar.radio(
-    "Navigation",
-    [
-        "🏠 Dashboard",
-        "🗑️ Bin Information",
-        "🤖 Fill Forecasting",
-        "🚛 Route Optimization",
-        "📊 Results",
-        "ℹ️ About Project"
-    ]
-)
-
-st.sidebar.divider()
-
-st.sidebar.caption(
-    "Smart Waste Collection Optimizer"
-)
-
-st.sidebar.caption(
-    "Fill-Level Forecasting & Route Planning"
-)
+    st.sidebar.warning("🟠 Backend offline - showing local CSV demo data")
+    st.sidebar.caption(f"API_URL = {API_URL}")
+    if st.sidebar.button("Retry connection"):
+        api_get.clear()
+        st.rerun()
+page = st.sidebar.radio("Navigation", ["🏠 Dashboard", "🗺️ Bin Map", "🤖 Fill Forecasting",
+                                       "🚛 Route Optimization", "📊 Results", "🧾 Service History", "ℹ️ About"])
 
 
-# ==================================================
-# DASHBOARD
-# ==================================================
+# ------------------------------------------------------------ pages
+def bin_map(df, route=None):
+    m = folium.Map(location=[DEPOT_LAT, DEPOT_LON], zoom_start=11)
+    folium.Marker([DEPOT_LAT, DEPOT_LON], tooltip="Depot", icon=folium.Icon(color="blue", icon="home")).add_to(m)
+    for _, r in df.iterrows():
+        color = "red" if r.fill_level >= CRITICAL_AT else "orange" if r.fill_level >= 70 else "green"
+        folium.Marker([r.latitude, r.longitude], tooltip=f"{r.bin_id} - {r.fill_level:.0f}%",
+                      popup=f"<b>{r.bin_id}</b><br>{r.location}<br>{r.fill_level:.0f}% ({r.status})",
+                      icon=folium.Icon(color=color)).add_to(m)
+    colors = ["blue", "purple", "darkgreen", "black"]
+    for i, trip in enumerate(route or []):
+        pts = [(DEPOT_LAT, DEPOT_LON)] + [(b["latitude"], b["longitude"]) for b in trip] + [(DEPOT_LAT, DEPOT_LON)]
+        folium.PolyLine(pts, weight=5, color=colors[i % 4], tooltip=f"Truck {i + 1}").add_to(m)
+    st_folium(m, width=1200, height=520, returned_objects=[])
+
 
 if page == "🏠 Dashboard":
-
-    st.title(
-        "🗑️ Smart Waste Collection Optimizer"
-    )
-
-    st.caption(
-        "Smart monitoring • Fill-level forecasting • "
-        "Route optimization"
-    )
-
-    st.divider()
-
-    st.subheader(
-        "📊 System Overview"
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-
-        st.metric(
-            "🗑️ Total Bins",
-            len(data)
-        )
-
-    with col2:
-
-        st.metric(
-            "🔴 Critical",
-            critical
-        )
-
-    with col3:
-
-        st.metric(
-            "🟠 High Fill",
-            high
-        )
-
-    with col4:
-
-        st.metric(
-            "🟢 Normal",
-            normal
-        )
-
-    st.divider()
-
-    # Collection summary
-
-    st.subheader(
-        "🚛 Collection Summary"
-    )
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-
-        st.metric(
-            "Bins Requiring Collection",
-            collection_required
-        )
-
-    with col2:
-
-        st.metric(
-            "Collected Bins",
-            collected
-        )
-
-    with col3:
-
-        pending = len(data) - collected
-
-        st.metric(
-            "Pending Bins",
-            pending
-        )
-
-    st.divider()
-
-    # System status
-
-    st.subheader(
-        "🚦 Current System Status"
-    )
-
-    if collection_required > 0:
-
-        st.warning(
-            f"⚠️ {collection_required} bin(s) "
-            "currently require collection."
-        )
-
+    st.title("🗑️ Smart Waste Collection Optimizer")
+    c = st.columns(4)
+    c[0].metric("Total bins", len(data))
+    c[1].metric("🔴 Critical (≥90%)", int((data.fill_level >= CRITICAL_AT).sum()))
+    c[2].metric("🟠 High (70-89%)", int(((data.fill_level >= 70) & (data.fill_level < CRITICAL_AT)).sum()))
+    c[3].metric("🟢 Normal (<70%)", int((data.fill_level < 70).sum()))
+    if len(to_collect):
+        st.warning(f"⚠️ Overflow alert: {len(to_collect)} bin(s) need collection.")
     else:
+        st.success("✅ No bins currently need collection.")
+    st.subheader("Collection tasks")
+    pending = data[data.status != "Collected"].sort_values("fill_level", ascending=False)
+    for _, r in pending.iterrows():
+        a, b, c3 = st.columns([3, 2, 1])
+        a.write(f"**{r.bin_id}** - {r.location}")
+        b.progress(min(int(r.fill_level), 100), text=f"{r.fill_level:.0f}%")
+        if c3.button("Mark collected", key=f"col_{r.bin_id}", disabled=(mode != "api")):
+            try:
+                api_put(f"/bins/{r.bin_id}/collect")
+                st.rerun()
+            except requests.RequestException as e:
+                st.error(f"Could not update {r.bin_id}: {e}")
+    st.caption(f"{int((data.status == 'Collected').sum())} bin(s) already collected.")
 
-        st.success(
-            "✅ All bins are currently below "
-            "the collection threshold."
-        )
-
-    # Collection required
-
-    st.subheader(
-        "🚛 Bins Requiring Collection"
-    )
-
-    collection_bins = data[
-        (data["fill_level"] >= 80) &
-        (data["status"] != "Collected")
-    ]
-
-    if len(collection_bins) > 0:
-
-        st.dataframe(
-            collection_bins,
-            use_container_width=True,
-            hide_index=True
-        )
-
-    else:
-
-        st.success(
-            "✅ No bins currently require collection."
-        )
-
-    st.divider()
-
-    # Collection status
-
-    st.subheader(
-        "📋 Collection Status"
-    )
-
-    pending_bins = data[
-        data["status"] != "Collected"
-    ].copy()
-
-    collected_bins = data[
-        data["status"] == "Collected"
-    ].copy()
-
-    if len(pending_bins) > 0:
-
-        st.write(
-            "Bins waiting for collection:"
-        )
-
-        for _, row in pending_bins.iterrows():
-
-            c1, c2, c3 = st.columns(
-                [2, 2, 1]
-            )
-
-            with c1:
-
-                st.write(
-                    f"**{row['bin_id']}** — "
-                    f"{row['location']}"
-                )
-
-            with c2:
-
-                st.write(
-                    f"Fill Level: "
-                    f"**{row['fill_level']}%**"
-                )
-
-            with c3:
-
-                if st.button(
-                    "Mark Collected",
-                    key=f"dashboard_collect_{row['bin_id']}"
-                ):
-
-                    result = mark_collected_api(
-                        row["bin_id"]
-                    )
-
-                    if result:
-
-                        st.success(
-                            f"{row['bin_id']} marked as collected."
-                        )
-
-                        st.rerun()
-
-                    else:
-
-                        st.error(
-                            "Could not update the bin "
-                            "through FastAPI."
-                        )
-
-    else:
-
-        st.success(
-            "✅ All bins have been collected."
-        )
-
-    if len(collected_bins) > 0:
-
-        st.write(
-            f"**{len(collected_bins)} "
-            "bin(s) collected.**"
-        )
-
-    st.divider()
-
-    # Project highlight
-
-    st.subheader(
-        "💡 Project Highlight"
-    )
-
-    st.info(
-        "This system combines machine-learning based "
-        "fill-level forecasting with OR-Tools route "
-        "optimization to support smarter and more "
-        "efficient waste collection."
-    )
-
-
-# ==================================================
-# BIN INFORMATION
-# ==================================================
-
-elif page == "🗑️ Bin Information":
-
-    st.title(
-        "🗑️ Bin Information"
-    )
-
-    st.caption(
-        "View waste-bin locations, fill levels "
-        "and collection status."
-    )
-
-    st.divider()
-
-    st.dataframe(
-        data,
-        use_container_width=True,
-        hide_index=True
-    )
-
-    st.divider()
-
-    st.subheader(
-        "🗺️ Waste Bin Locations"
-    )
-
-    waste_map = folium.Map(
-        location=[
-            DEPOT_LAT,
-            DEPOT_LON
-        ],
-        zoom_start=11
-    )
-
-    for _, row in data.iterrows():
-
-        if row["fill_level"] >= 90:
-
-            icon_color = "red"
-
-        elif row["fill_level"] >= 70:
-
-            icon_color = "orange"
-
-        else:
-
-            icon_color = "green"
-
-        folium.Marker(
-
-            location=[
-                row["latitude"],
-                row["longitude"]
-            ],
-
-            popup=(
-                f"<b>{row['bin_id']}</b><br>"
-                f"Location: {row['location']}<br>"
-                f"Fill Level: {row['fill_level']}%<br>"
-                f"Status: {row['status']}"
-            ),
-
-            tooltip=(
-                f"{row['bin_id']} - "
-                f"{row['fill_level']}%"
-            ),
-
-            icon=folium.Icon(
-                color=icon_color
-            )
-
-        ).add_to(waste_map)
-
-    st_folium(
-        waste_map,
-        width=1200,
-        height=550
-    )
-
-
-# ==================================================
-# FILL FORECASTING
-# ==================================================
+elif page == "🗺️ Bin Map":
+    st.title("🗺️ Bin Map")
+    bin_map(data)
+    st.dataframe(data, use_container_width=True, hide_index=True)
 
 elif page == "🤖 Fill Forecasting":
-
-    st.title(
-        "🤖 Fill-Level Forecasting"
-    )
-
-    st.caption(
-        "Predict future waste-bin fill levels "
-        "using historical data."
-    )
-
-    st.divider()
-
-    if data.empty:
-
-        st.warning(
-            "No bin data available."
-        )
-
+    st.title("🤖 Fill-Level Forecasting")
+    bin_id = st.selectbox("Bin", data.bin_id.tolist())
+    try:
+        f = api_get(f"/forecast/{bin_id}")
+        hist = pd.DataFrame(f["historical_data"])
+        preds = [p["predicted_fill"] for p in f["forecast"]]
+        source = "FastAPI backend"
+    except Exception:
+        st.warning("Backend forecast unavailable - using local CSV history.")
+        hist = load_csv("fill_history.csv")
+        hist = hist[hist.bin_id == bin_id].copy()
+        if len(hist) < 2:
+            st.stop()
+        from forecasting import forecast_from_history
+        preds, mae, dtf = forecast_from_history(hist.to_dict("records"))
+        f = {"mae_percentage_points": mae, "days_until_full": dtf}
+        source = "local model"
+    c = st.columns(5)
+    for col, label, p in zip(c[:3], ["Tomorrow", "In 2 days", "In 3 days"], preds):
+        col.metric(label, f"{p:.1f}%")
+    c[3].metric("Model error (MAE)", "n/a" if f.get("mae_percentage_points") is None else f"±{f['mae_percentage_points']} pts")
+    c[4].metric("Days until full", "n/a" if f.get("days_until_full") is None else f["days_until_full"])
+    n = len(hist)
+    chart = pd.DataFrame({"Historical": list(hist.fill_level) + [None] * 3,
+                          "Predicted": [None] * (n - 1) + [hist.fill_level.iloc[-1]] + preds})
+    st.line_chart(chart)
+    if preds[0] >= CRITICAL_AT:
+        st.error("🚨 Predicted to reach a critical level tomorrow - schedule collection.")
+    elif preds[0] >= COLLECT_AT:
+        st.warning("⚠️ Approaching the collection threshold.")
     else:
-
-        selected_bin = st.selectbox(
-            "Select Waste Bin",
-            data["bin_id"].tolist()
-        )
-
-        # ------------------------------------------
-        # USE FASTAPI FORECAST
-        # ------------------------------------------
-
-        forecast_response = get_api_data(
-            f"/forecast/{selected_bin}"
-        )
-
-        if (
-            forecast_response
-            and "forecast" in forecast_response
-        ):
-
-            forecast_data = forecast_response[
-                "forecast"
-            ]
-
-            predictions = [
-                item["predicted_fill"]
-                for item in forecast_data
-            ]
-
-            historical_data = forecast_response.get(
-                "historical_data",
-                []
-            )
-
-            bin_history = pd.DataFrame(
-                historical_data
-            )
-
-            if not bin_history.empty:
-
-                if "date" in bin_history.columns:
-
-                    bin_history["date"] = pd.to_datetime(
-                        bin_history["date"]
-                    )
-
-            # --------------------------------------
-            # FORECAST METRICS
-            # --------------------------------------
-
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-
-                st.metric(
-                    "Tomorrow",
-                    f"{predictions[0]:.1f}%"
-                )
-
-            with col2:
-
-                st.metric(
-                    "After 2 Days",
-                    f"{predictions[1]:.1f}%"
-                )
-
-            with col3:
-
-                st.metric(
-                    "After 3 Days",
-                    f"{predictions[2]:.1f}%"
-                )
-
-            st.divider()
-
-            st.write(
-                "### 📈 Predicted Fill-Level"
-            )
-
-            # Historical + predicted chart
-
-            if (
-                not bin_history.empty
-                and "fill_level" in bin_history.columns
-            ):
-
-                chart_data = pd.DataFrame(
-                    {
-                        "Historical Fill Level":
-                            bin_history["fill_level"].tolist()
-                            + [None, None, None],
-
-                        "Predicted Fill Level":
-                            [None] * len(bin_history)
-                            + predictions
-                    }
-                )
-
-                st.line_chart(
-                    chart_data,
-                    y=[
-                        "Historical Fill Level",
-                        "Predicted Fill Level"
-                    ]
-                )
-
-            # --------------------------------------
-            # FORECAST WARNING
-            # --------------------------------------
-
-            if predictions[0] >= 90:
-
-                st.error(
-                    "🚨 This bin is predicted to "
-                    "reach critical level soon!"
-                )
-
-            elif predictions[0] >= 80:
-
-                st.warning(
-                    "⚠️ This bin is approaching "
-                    "the collection threshold."
-                )
-
-            else:
-
-                st.success(
-                    "✅ This bin does not require "
-                    "immediate collection."
-                )
-
-            st.caption(
-                "Forecast generated by the FastAPI "
-                "backend using Linear Regression."
-            )
-
-        else:
-
-            # --------------------------------------
-            # FALLBACK TO LOCAL FORECAST
-            # --------------------------------------
-
-            st.warning(
-                "FastAPI forecast unavailable. "
-                "Using local historical data."
-            )
-
-            bin_history = history[
-                history["bin_id"] == selected_bin
-            ].copy()
-
-            if len(bin_history) >= 2:
-
-                bin_history["day"] = range(
-                    len(bin_history)
-                )
-
-                X = bin_history[["day"]]
-                y = bin_history["fill_level"]
-
-                model = LinearRegression()
-
-                model.fit(X, y)
-
-                current_day = (
-                    len(bin_history) - 1
-                )
-
-                future_days = pd.DataFrame(
-                    {
-                        "day": [
-                            current_day + 1,
-                            current_day + 2,
-                            current_day + 3
-                        ]
-                    }
-                )
-
-                predictions = model.predict(
-                    future_days
-                )
-
-                predictions = [
-                    max(
-                        0,
-                        min(
-                            100,
-                            value
-                        )
-                    )
-                    for value in predictions
-                ]
-
-                col1, col2, col3 = st.columns(3)
-
-                with col1:
-
-                    st.metric(
-                        "Tomorrow",
-                        f"{predictions[0]:.1f}%"
-                    )
-
-                with col2:
-
-                    st.metric(
-                        "After 2 Days",
-                        f"{predictions[1]:.1f}%"
-                    )
-
-                with col3:
-
-                    st.metric(
-                        "After 3 Days",
-                        f"{predictions[2]:.1f}%"
-                    )
-
-                st.divider()
-
-                chart_data = pd.DataFrame(
-                    {
-                        "Historical Fill Level":
-                            bin_history["fill_level"].tolist()
-                            + [None, None, None],
-
-                        "Predicted Fill Level":
-                            [None] * len(bin_history)
-                            + predictions
-                    }
-                )
-
-                st.line_chart(
-                    chart_data,
-                    y=[
-                        "Historical Fill Level",
-                        "Predicted Fill Level"
-                    ]
-                )
-
-                if predictions[0] >= 90:
-
-                    st.error(
-                        "🚨 This bin is predicted to "
-                        "reach critical level soon!"
-                    )
-
-                elif predictions[0] >= 80:
-
-                    st.warning(
-                        "⚠️ This bin is approaching "
-                        "the collection threshold."
-                    )
-
-                else:
-
-                    st.success(
-                        "✅ This bin does not require "
-                        "immediate collection."
-                    )
-
-            else:
-
-                st.warning(
-                    "Not enough historical data "
-                    "for forecasting."
-                )
-
-
-# ==================================================
-# ROUTE OPTIMIZATION
-# ==================================================
+        st.success("✅ No immediate collection needed.")
+    st.caption(f"Source: {source}. Linear regression on calendar days; MAE = one-step-ahead backtest.")
 
 elif page == "🚛 Route Optimization":
-
-    st.title(
-        "🚛 Route Optimization"
-    )
-
-    st.caption(
-        "OR-Tools generates an efficient collection "
-        "route for bins that have reached 80% fill level."
-    )
-
-    st.divider()
-
-    route_bins = data[
-        (data["fill_level"] >= 80) &
-        (data["status"] != "Collected")
-    ].copy().reset_index(drop=True)
-
-    if len(route_bins) == 0:
-
-        st.success(
-            "✅ No bins need collection right now."
-        )
-
-    else:
-
-        locations = [
-            (
-                DEPOT_LAT,
-                DEPOT_LON
-            )
-        ]
-
-        for _, row in route_bins.iterrows():
-
-            locations.append(
-                (
-                    float(row["latitude"]),
-                    float(row["longitude"])
-                )
-            )
-
-        # ------------------------------------------
-        # Distance function
-        # ------------------------------------------
-
-        def calculate_distance(
-            lat1,
-            lon1,
-            lat2,
-            lon2
-        ):
-
-            lat_distance = (
-                lat1 - lat2
-            ) * 111
-
-            lon_distance = (
-                lon1 - lon2
-            ) * 111 * 0.94
-
-            return math.sqrt(
-                lat_distance ** 2 +
-                lon_distance ** 2
-            )
-
-        # ------------------------------------------
-        # Baseline route
-        # ------------------------------------------
-
-        baseline_distance = 0
-
-        current_lat = DEPOT_LAT
-        current_lon = DEPOT_LON
-
-        for _, row in route_bins.iterrows():
-
-            baseline_distance += calculate_distance(
-                current_lat,
-                current_lon,
-                float(row["latitude"]),
-                float(row["longitude"])
-            )
-
-            current_lat = float(
-                row["latitude"]
-            )
-
-            current_lon = float(
-                row["longitude"]
-            )
-
-        baseline_distance += calculate_distance(
-            current_lat,
-            current_lon,
-            DEPOT_LAT,
-            DEPOT_LON
-        )
-
-        # ------------------------------------------
-        # Distance matrix
-        # ------------------------------------------
-
-        distance_matrix = []
-
-        for from_lat, from_lon in locations:
-
-            row_distances = []
-
-            for to_lat, to_lon in locations:
-
-                lat_distance = (
-                    from_lat - to_lat
-                ) * 111000
-
-                lon_distance = (
-                    from_lon - to_lon
-                ) * 111000 * 0.94
-
-                distance = (
-                    lat_distance ** 2 +
-                    lon_distance ** 2
-                ) ** 0.5
-
-                row_distances.append(
-                    int(distance)
-                )
-
-            distance_matrix.append(
-                row_distances
-            )
-
-        # ------------------------------------------
-        # OR-Tools
-        # ------------------------------------------
-
-        manager = pywrapcp.RoutingIndexManager(
-            len(distance_matrix),
-            1,
-            0
-        )
-
-        routing = pywrapcp.RoutingModel(
-            manager
-        )
-
-        def distance_callback(
-            from_index,
-            to_index
-        ):
-
-            from_node = manager.IndexToNode(
-                from_index
-            )
-
-            to_node = manager.IndexToNode(
-                to_index
-            )
-
-            return distance_matrix[
-                from_node
-            ][
-                to_node
-            ]
-
-        transit_callback_index = (
-            routing.RegisterTransitCallback(
-                distance_callback
-            )
-        )
-
-        routing.SetArcCostEvaluatorOfAllVehicles(
-            transit_callback_index
-        )
-
-        search_parameters = (
-            pywrapcp.DefaultRoutingSearchParameters()
-        )
-
-        search_parameters.first_solution_strategy = (
-            routing_enums_pb2
-            .FirstSolutionStrategy
-            .PATH_CHEAPEST_ARC
-        )
-
-        search_parameters.local_search_metaheuristic = (
-            routing_enums_pb2
-            .LocalSearchMetaheuristic
-            .GUIDED_LOCAL_SEARCH
-        )
-
-        search_parameters.time_limit.seconds = 5
-
-        solution = routing.SolveWithParameters(
-            search_parameters
-        )
-
-        if solution:
-
-            index = routing.Start(0)
-
-            route_order = []
-            total_distance = 0
-
-            while not routing.IsEnd(index):
-
-                node = manager.IndexToNode(
-                    index
-                )
-
-                route_order.append(node)
-
-                previous_index = index
-
-                index = solution.Value(
-                    routing.NextVar(index)
-                )
-
-                total_distance += (
-                    routing.GetArcCostForVehicle(
-                        previous_index,
-                        index,
-                        0
-                    )
-                )
-
-            route_order.append(
-                manager.IndexToNode(index)
-            )
-
-            optimized_distance = (
-                total_distance / 1000
-            )
-
-            distance_saved = (
-                baseline_distance -
-                optimized_distance
-            )
-
-            if baseline_distance > 0:
-
-                improvement = (
-                    distance_saved /
-                    baseline_distance
-                ) * 100
-
-            else:
-
-                improvement = 0
-
-            # --------------------------------------
-            # PERFORMANCE
-            # --------------------------------------
-
-            st.subheader(
-                "📊 Route Performance"
-            )
-
-            col1, col2, col3, col4 = st.columns(4)
-
-            with col1:
-
-                st.metric(
-                    "📏 Baseline",
-                    f"{baseline_distance:.2f} km"
-                )
-
-            with col2:
-
-                st.metric(
-                    "🚛 Optimized",
-                    f"{optimized_distance:.2f} km"
-                )
-
-            with col3:
-
-                st.metric(
-                    "💡 Saved",
-                    f"{max(0, distance_saved):.2f} km"
-                )
-
-            with col4:
-
-                st.metric(
-                    "📈 Improvement",
-                    f"{max(0, improvement):.1f}%"
-                )
-
-            if distance_saved > 0:
-
-                st.success(
-                    f"✅ OR-Tools reduced the route by "
-                    f"{distance_saved:.2f} km "
-                    f"({improvement:.1f}% improvement)."
-                )
-
-            else:
-
-                st.info(
-                    "ℹ️ The optimized route is similar "
-                    "to the baseline route for the "
-                    "current bin locations."
-                )
-
-            # --------------------------------------
-            # COMPARISON CHART
-            # --------------------------------------
-
-            comparison_data = pd.DataFrame(
-                {
-                    "Route": [
-                        "Baseline",
-                        "OR-Tools Optimized"
-                    ],
-
-                    "Distance (km)": [
-                        baseline_distance,
-                        optimized_distance
-                    ]
-                }
-            )
-
-            st.write(
-                "### 📊 Distance Comparison"
-            )
-
-            st.bar_chart(
-                comparison_data.set_index("Route")
-            )
-
-            st.divider()
-
-            # --------------------------------------
-            # ROUTE MAP
-            # --------------------------------------
-
-            st.write(
-                "### 🗺️ Optimized Route Map"
-            )
-
-            route_map = folium.Map(
-                location=[
-                    DEPOT_LAT,
-                    DEPOT_LON
-                ],
-                zoom_start=11
-            )
-
-            folium.Marker(
-                location=[
-                    DEPOT_LAT,
-                    DEPOT_LON
-                ],
-                popup="<b>🚛 Collection Depot</b>",
-                tooltip="Collection Depot",
-                icon=folium.Icon(
-                    color="blue",
-                    icon="home"
-                )
-            ).add_to(route_map)
-
-            route_coordinates = []
-
-            for stop_number, node in enumerate(
-                route_order
-            ):
-
-                lat, lon = locations[node]
-
-                route_coordinates.append(
-                    [lat, lon]
-                )
-
-                if node != 0:
-
-                    bin_position = node - 1
-
-                    bin_row = route_bins.iloc[
-                        bin_position
-                    ]
-
-                    folium.Marker(
-                        location=[
-                            lat,
-                            lon
-                        ],
-
-                        popup=(
-                            f"<b>Stop {stop_number}</b><br>"
-                            f"Bin: {bin_row['bin_id']}<br>"
-                            f"Location: {bin_row['location']}<br>"
-                            f"Fill Level: "
-                            f"{bin_row['fill_level']}%"
-                        ),
-
-                        tooltip=(
-                            f"Stop {stop_number}: "
-                            f"{bin_row['bin_id']}"
-                        ),
-
-                        icon=folium.Icon(
-                            color="red",
-                            icon="trash"
-                        )
-
-                    ).add_to(route_map)
-
-            folium.PolyLine(
-                locations=route_coordinates,
-                weight=5,
-                opacity=0.8,
-                tooltip="Optimized Collection Route"
-            ).add_to(route_map)
-
-            st_folium(
-                route_map,
-                width=1200,
-                height=550
-            )
-
-            st.divider()
-
-            # --------------------------------------
-            # ROUTE INFORMATION
-            # --------------------------------------
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-
-                st.metric(
-                    "🗑️ Bins to Collect",
-                    len(route_bins)
-                )
-
-            with col2:
-
-                st.metric(
-                    "📏 Route Distance",
-                    f"{optimized_distance:.2f} km"
-                )
-
-            st.success(
-                "✅ Optimized collection route "
-                "generated using OR-Tools."
-            )
-
-            # --------------------------------------
-            # COLLECTION ORDER
-            # --------------------------------------
-
-            st.write(
-                "### 📋 Collection Order"
-            )
-
-            route_table = []
-
-            for stop_number, node in enumerate(
-                route_order
-            ):
-
-                if node == 0:
-
-                    route_table.append(
-                        {
-                            "Stop": stop_number,
-                            "Bin": "DEPOT",
-                            "Location":
-                                "Collection Depot",
-                            "Fill Level": "-"
-                        }
-                    )
-
-                else:
-
-                    bin_position = node - 1
-
-                    bin_row = route_bins.iloc[
-                        bin_position
-                    ]
-
-                    route_table.append(
-                        {
-                            "Stop": stop_number,
-                            "Bin":
-                                bin_row["bin_id"],
-                            "Location":
-                                bin_row["location"],
-                            "Fill Level":
-                                f"{bin_row['fill_level']}%"
-                        }
-                    )
-
-            st.dataframe(
-                pd.DataFrame(route_table),
-                use_container_width=True,
-                hide_index=True
-            )
-
-        else:
-
-            st.error(
-                "❌ OR-Tools could not generate a route."
-            )
-
-
-# ==================================================
-# RESULTS
-# ==================================================
+    st.title("🚛 Route Optimization")
+    st.caption("Constraint-aware OR-Tools routing vs. three baselines, with truck capacity.")
+    c1, c2 = st.columns(2)
+    capacity = c1.number_input("Truck capacity (bin-units)", 100, 2000, 300, step=50)
+    trucks = c2.number_input("Trucks available", 1, 6, 2)
+    if to_collect.empty:
+        st.success("✅ No bins need collection right now.")
+        st.stop()
+    bins = to_collect.to_dict("records")
+    with st.spinner("Optimising..."):
+        res = opt.compare(bins, capacity, trucks)
+    table = pd.DataFrame([{"Strategy": k, "Distance (km)": round(v["km"], 2), "Trips": len(v["trips"])}
+                          for k, v in res.items()])
+    best_base = min(v["km"] for k, v in res.items() if not k.startswith("OR-Tools"))
+    ort = res["OR-Tools (capacity-aware)"]
+    st.dataframe(table, hide_index=True, use_container_width=True)
+    st.bar_chart(table.set_index("Strategy")["Distance (km)"])
+    fixed = res["Fixed round (current process)"]["km"]
+    m = st.columns(3)
+    m[0].metric("Saved vs current process", f"{fixed - ort['km']:.1f} km", f"{(fixed - ort['km']) / fixed * 100:.1f}%")
+    m[1].metric("Saved vs best baseline", f"{best_base - ort['km']:.1f} km")
+    m[2].metric("Bins skipped", len(ort["dropped"]))
+    if ort["dropped"]:
+        st.error("Some bins could not be served with this capacity/truck count: " +
+                 ", ".join(b["bin_id"] for b in ort["dropped"]))
+    bin_map(data, ort["trips"])
+    rows = [{"Truck": i + 1, "Stop": s + 1, "Bin": b["bin_id"], "Location": b["location"],
+             "Fill %": b["fill_level"]} for i, t in enumerate(ort["trips"]) for s, b in enumerate(t)]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 elif page == "📊 Results":
-
-    st.title(
-        "📊 Project Performance & Results"
-    )
-
-    st.caption(
-        "Overall performance of the Smart Waste "
-        "Collection Optimizer."
-    )
-
-    st.divider()
-
-    st.subheader(
-        "📌 Overall System Statistics"
-    )
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-
-        st.metric(
-            "🗑️ Total Bins",
-            len(data)
-        )
-
-    with col2:
-
-        st.metric(
-            "🚛 Collection Required",
-            collection_required
-        )
-
-    with col3:
-
-        st.metric(
-            "✅ Collected",
-            collected
-        )
-
-    with col4:
-
-        st.metric(
-            "🔴 Critical",
-            critical
-        )
-
-    st.divider()
-
-    st.subheader(
-        "🚛 Route Optimization Results"
-    )
-
-    route_bins = data[
-        (data["fill_level"] >= 80) &
-        (data["status"] != "Collected")
-    ].copy()
-
-    if len(route_bins) > 0:
-
-        locations = [
-            (
-                DEPOT_LAT,
-                DEPOT_LON
-            )
-        ]
-
-        for _, row in route_bins.iterrows():
-
-            locations.append(
-                (
-                    float(row["latitude"]),
-                    float(row["longitude"])
-                )
-            )
-
-        def result_distance(
-            lat1,
-            lon1,
-            lat2,
-            lon2
-        ):
-
-            lat_distance = (
-                lat1 - lat2
-            ) * 111
-
-            lon_distance = (
-                lon1 - lon2
-            ) * 111 * 0.94
-
-            return math.sqrt(
-                lat_distance ** 2 +
-                lon_distance ** 2
-            )
-
-        baseline = 0
-
-        current_lat = DEPOT_LAT
-        current_lon = DEPOT_LON
-
-        for _, row in route_bins.iterrows():
-
-            baseline += result_distance(
-                current_lat,
-                current_lon,
-                float(row["latitude"]),
-                float(row["longitude"])
-            )
-
-            current_lat = float(
-                row["latitude"]
-            )
-
-            current_lon = float(
-                row["longitude"]
-            )
-
-        baseline += result_distance(
-            current_lat,
-            current_lon,
-            DEPOT_LAT,
-            DEPOT_LON
-        )
-
-        matrix = []
-
-        for from_lat, from_lon in locations:
-
-            row_distances = []
-
-            for to_lat, to_lon in locations:
-
-                lat_distance = (
-                    from_lat - to_lat
-                ) * 111000
-
-                lon_distance = (
-                    from_lon - to_lon
-                ) * 111000 * 0.94
-
-                distance = math.sqrt(
-                    lat_distance ** 2 +
-                    lon_distance ** 2
-                )
-
-                row_distances.append(
-                    int(distance)
-                )
-
-            matrix.append(
-                row_distances
-            )
-
-        manager = pywrapcp.RoutingIndexManager(
-            len(matrix),
-            1,
-            0
-        )
-
-        routing = pywrapcp.RoutingModel(
-            manager
-        )
-
-        def result_callback(
-            from_index,
-            to_index
-        ):
-
-            return matrix[
-                manager.IndexToNode(
-                    from_index
-                )
-            ][
-                manager.IndexToNode(
-                    to_index
-                )
-            ]
-
-        callback_index = (
-            routing.RegisterTransitCallback(
-                result_callback
-            )
-        )
-
-        routing.SetArcCostEvaluatorOfAllVehicles(
-            callback_index
-        )
-
-        parameters = (
-            pywrapcp.DefaultRoutingSearchParameters()
-        )
-
-        parameters.first_solution_strategy = (
-            routing_enums_pb2
-            .FirstSolutionStrategy
-            .PATH_CHEAPEST_ARC
-        )
-
-        parameters.local_search_metaheuristic = (
-            routing_enums_pb2
-            .LocalSearchMetaheuristic
-            .GUIDED_LOCAL_SEARCH
-        )
-
-        parameters.time_limit.seconds = 5
-
-        solution = routing.SolveWithParameters(
-            parameters
-        )
-
-        if solution:
-
-            index = routing.Start(0)
-
-            optimized = 0
-
-            while not routing.IsEnd(index):
-
-                previous = index
-
-                index = solution.Value(
-                    routing.NextVar(index)
-                )
-
-                optimized += (
-                    routing.GetArcCostForVehicle(
-                        previous,
-                        index,
-                        0
-                    )
-                )
-
-            optimized = optimized / 1000
-
-            saved = max(
-                0,
-                baseline - optimized
-            )
-
-            if baseline > 0:
-
-                improvement = (
-                    saved / baseline
-                ) * 100
-
-            else:
-
-                improvement = 0
-
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-
-                st.metric(
-                    "Baseline Distance",
-                    f"{baseline:.2f} km"
-                )
-
-            with col2:
-
-                st.metric(
-                    "Optimized Distance",
-                    f"{optimized:.2f} km"
-                )
-
-            with col3:
-
-                st.metric(
-                    "Distance Saved",
-                    f"{saved:.2f} km"
-                )
-
-            st.metric(
-                "📈 Route Improvement",
-                f"{max(0, improvement):.1f}%"
-            )
-
-            if improvement > 0:
-
-                st.success(
-                    f"🎯 Route efficiency improved by "
-                    f"{improvement:.1f}% compared with "
-                    "the baseline route."
-                )
-
-            else:
-
-                st.info(
-                    "The current bin locations do not "
-                    "provide a significant distance reduction."
-                )
-
-        else:
-
-            st.warning(
-                "Route results are currently unavailable."
-            )
-
+    st.title("📊 Evaluation Results")
+    st.subheader("Route reduction (all bins ≥ 80%)")
+    if to_collect.empty:
+        st.info("No bins need collection right now.")
     else:
+        res = opt.compare(to_collect.to_dict("records"), 300, 2)
+        st.dataframe(pd.DataFrame([{"Strategy": k, "Distance (km)": round(v["km"], 2), "Trips": len(v["trips"])}
+                                   for k, v in res.items()]), hide_index=True, use_container_width=True)
+    st.subheader("Backend telemetry")
+    try:
+        mt = api_get("/metrics")
+        c = st.columns(4)
+        c[0].metric("Requests", mt["requests"])
+        c[1].metric("Errors", mt["errors"])
+        c[2].metric("Avg latency", f"{mt['avg_latency_ms']} ms")
+        c[3].metric("Uptime", f"{mt['uptime_s'] // 60} min")
+    except Exception:
+        st.info("Backend metrics unavailable while offline.")
+    st.caption("Add your forecast MAE table and battery-life test results here once the sensor simulator has run.")
 
-        st.info(
-            "No pending bins are currently available "
-            "for route comparison."
-        )
+elif page == "🧾 Service History":
+    st.title("🧾 Service History (audit trail)")
+    try:
+        rows = api_get("/service-history")["history"]
+        st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True) if rows else st.info("No collections yet.")
+    except Exception:
+        st.info("Available when the backend is connected.")
 
-    st.divider()
-
-    st.subheader(
-        "🏆 Project Summary"
-    )
-
-    st.info(
-        "The Smart Waste Collection Optimizer is an "
-        "intelligent waste-management system that "
-        "monitors bin fill levels, predicts future "
-        "fill levels using Linear Regression, identifies "
-        "bins requiring collection and generates an "
-        "optimized collection route using Google "
-        "OR-Tools."
-    )
-
-    st.subheader(
-        "📝 Project Conclusion"
-    )
-
-    st.success(
-        "The system demonstrates how machine learning "
-        "and route optimization can work together to "
-        "support smarter waste collection. By predicting "
-        "fill levels and optimizing collection routes, "
-        "the system can help reduce unnecessary travel, "
-        "save collection time and improve overall "
-        "waste-management efficiency."
-    )
-
-
-# ==================================================
-# ABOUT PROJECT
-# ==================================================
-
-elif page == "ℹ️ About Project":
-
-    st.title(
-        "ℹ️ About the Project"
-    )
-
-    st.caption(
-        "Project overview, technologies and key features."
-    )
-
-    st.write(
-        "### 🗑️ Smart Waste Collection Optimizer"
-    )
-
-    st.write(
-        "This project combines fill-level forecasting "
-        "and route optimization to improve waste "
-        "collection planning."
-    )
-
-    st.divider()
-
-    st.subheader(
-        "🎯 Project Objective"
-    )
-
-    st.write(
-        "To identify waste bins that require collection "
-        "and generate an efficient route for the collection "
-        "vehicle."
-    )
-
-    st.subheader(
-        "⚙️ Technologies Used"
-    )
-
-    st.write(
-        """
-        - Python
-        - Streamlit
-        - FastAPI
-        - Supabase
-        - Pandas
-        - Scikit-learn
-        - Folium
-        - Streamlit-Folium
-        - Google OR-Tools
-        """
-    )
-
-    st.subheader(
-        "🤖 Main Features"
-    )
-
-    st.write(
-        """
-        - Waste-bin fill-level monitoring
-        - Fill-level forecasting
-        - Collection status management
-        - Waste-bin map visualization
-        - Baseline route calculation
-        - OR-Tools route optimization
-        - Route distance comparison
-        - Performance evaluation
-        - FastAPI backend integration
-        - Supabase database integration
-        - Professional dashboard interface
-        """
-    )
-
-    st.subheader(
-        "💡 Expected Benefit"
-    )
-
-    st.write(
-        "The system can help reduce unnecessary travel, "
-        "save collection time and improve waste-management "
-        "efficiency."
-    )
-
-    st.divider()
-
-    st.subheader(
-        "🏆 Final Project Statement"
-    )
-
-    st.success(
-        "Smart Waste Collection Optimizer provides a "
-        "complete workflow from waste-bin monitoring and "
-        "prediction to optimized collection planning."
-    )
+else:
+    st.title("ℹ️ About")
+    st.write("Streamlit dashboard → FastAPI (Render) → Supabase Postgres. Forecasting: scikit-learn linear "
+             "regression. Routing: Google OR-Tools capacitated VRP compared with three baselines. "
+             "Sensor intake: `POST /readings` (used by `simulator.py`).")
