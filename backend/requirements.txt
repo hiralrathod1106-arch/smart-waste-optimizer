@@ -1,8 +1,6 @@
-# Streamlit frontend (Streamlit Community Cloud installs this file)
-streamlit>=1.40
-pandas>=2.2
-folium>=0.17
-streamlit-folium>=0.22
-scikit-learn>=1.5
-ortools>=9.10
-requests>=2.32
+   fastapi>=0.115
+   uvicorn>=0.30
+   supabase>=2.9
+   python-dotenv>=1.0
+   scikit-learn>=1.5
+   pydantic>=2.7
