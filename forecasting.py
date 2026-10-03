@@ -64,3 +64,29 @@ def classify_alerts(bins, history):
                        "eta_days": eta, "message": msg})
     alerts.sort(key=lambda a: (_SEV_ORDER[a["severity"]], -a["fill_level"]))
     return alerts
+
+
+def evaluation_table(bins, history):
+    """One row per bin for the Results page: forecast error, battery estimate, days until full."""
+    by_bin = {}
+    for h in history:
+        by_bin.setdefault(h["bin_id"], []).append(h)
+    out = []
+    for b in bins:
+        rows = by_bin.get(b["bin_id"], [])
+        mae = dtf = None
+        if len(rows) >= 2:
+            _, mae, dtf = forecast_from_history(rows)
+        # battery: latest reading + estimated days left from the average drain per day
+        batt = [(date.fromisoformat(str(r["date"])[:10]), float(r["battery_pct"]))
+                for r in rows if r.get("battery_pct") is not None]
+        last_batt = life = None
+        if batt:
+            last_batt = batt[-1][1]
+            span = (batt[-1][0] - batt[0][0]).days
+            drain = (batt[0][1] - batt[-1][1]) / span if span > 0 else 0
+            life = round(last_batt / drain, 1) if drain > 0 else None
+        out.append({"bin_id": b["bin_id"], "location": b["location"], "readings": len(rows),
+                    "fill_now": float(b["fill_level"]), "mae_pts": mae, "days_until_full": dtf,
+                    "battery_pct": last_batt, "battery_days_left": life})
+    return out
